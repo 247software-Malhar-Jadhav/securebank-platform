@@ -1,0 +1,15 @@
+# Dashboard provider. Drop Grafana dashboard JSON files into ./dashboards and they
+# will be auto-loaded. (Import the community "JVM (Micrometer)" dashboard id 4701 and
+# "Spring Boot 3.x" id 19004 from grafana.com for a quick start.)
+apiVersion: 1
+providers:
+  - name: SecureBank
+    orgId: 1
+    folder: SecureBank
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

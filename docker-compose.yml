@@ -1,0 +1,456 @@
+# =============================================================================
+# SecureBank — FULL microservices mesh (docker-compose).
+#
+# Brings up the entire platform from source: infrastructure (Postgres, Redis,
+# Zookeeper, Kafka, RabbitMQ) + the six JVM services + the three micro-frontends,
+# plus an optional `observability` profile (kafka-ui, Prometheus, Grafana).
+#
+# Conventions (see MICROSERVICES_SPEC.md and docs/running-locally.md):
+#   * Every service runs with SPRING_PROFILES_ACTIVE=docker so it addresses its
+#     dependencies by docker-network service NAME (postgres, redis, kafka, ...).
+#   * Database-per-service: auth-service owns DB `auth`; account/transaction/
+#     notification share DB `securebank` but each owns its OWN schema
+#     (accounts / ledger / notifications) — no cross-schema access. The 4 logical
+#     databases are created by ./postgres-init/01-init-databases.sql.
+#   * Kafka's broker is advertised INTERNALLY as kafka:29092 (spec §8) to keep it
+#     clear of the gRPC 909x ports; the host gets 29092 too for local tooling.
+#   * Only the gateway (8080) and the three frontends (5170/5171/5172) are meant
+#     to be hit from the host; the services are reachable but are "internal".
+#
+# Usage:
+#   cp .env.example .env          # then edit secrets
+#   docker compose up -d --build  # core mesh
+#   docker compose --profile observability up -d   # + kafka-ui/prometheus/grafana
+# =============================================================================
+
+name: securebank
+
+# ---- Reusable YAML anchors --------------------------------------------------
+x-restart: &restart
+  restart: unless-stopped
+
+# Common healthcheck timing for the JVM services (they boot in ~30-60s).
+x-svc-healthcheck-defaults: &svc-hc-defaults
+  interval: 15s
+  timeout: 5s
+  retries: 20
+  start_period: 90s
+
+services:
+
+  # ===========================================================================
+  # INFRASTRUCTURE
+  # ===========================================================================
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: securebank-postgres
+    <<: *restart
+    environment:
+      # The bootstrap superuser. The init script (mounted below) creates the
+      # per-service login roles and the `auth` + `securebank` databases.
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERPASSWORD:-postgres}
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # *.sql / *.sh in this dir run ONCE, in lexical order, on first init.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER:-postgres} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: securebank-redis
+    <<: *restart
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: securebank-zookeeper
+    <<: *restart
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      # IMPORTANT: the Confluent image LOCKS DOWN the 4-letter-word admin commands
+      # by default. The healthcheck below uses `ruok`, so we MUST whitelist it (plus
+      # srvr/conf for diagnostics). Forgetting this makes `ruok` return nothing and
+      # the healthcheck never goes healthy — a real bug we hit in a previous compose.
+      ZOOKEEPER_4LW_COMMANDS_WHITELIST: "ruok,srvr,conf"
+    healthcheck:
+      # `ruok` returns "imok" only when ZK is up AND ruok is whitelisted (above).
+      # Use bash explicitly (the Confluent image ships it) so the /dev/tcp redirection
+      # works — /dev/tcp is a bash builtin, not available in plain sh/dash.
+      test: ["CMD", "bash", "-c", "echo ruok | (exec 3<>/dev/tcp/localhost/2181; cat >&3; cat <&3) | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: securebank-kafka
+    <<: *restart
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      # Host access for local tooling (kafkacat, kafka-ui from host, etc.).
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Two listeners:
+      #   INTERNAL (kafka:29092)  — what in-network services connect to (spec §8).
+      #   EXTERNAL (localhost:29092 mapped) — for tooling on the host.
+      # Both advertise 29092 to stay clear of the gRPC 909x ports.
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # The broker is "ready" once the API responds on the internal listener.
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:29092 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  # One-shot: wait for the broker, then create the 3 domain topics, then exit.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: securebank-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # `restart: no` so this does not loop after it succeeds.
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        echo "Creating SecureBank Kafka topics on kafka:29092 ..."
+        for t in securebank.transactions securebank.fraud-alerts securebank.notifications; do
+          kafka-topics --bootstrap-server kafka:29092 \
+            --create --if-not-exists \
+            --topic "$$t" --partitions 3 --replication-factor 1
+        done
+        echo "Topics present:"
+        kafka-topics --bootstrap-server kafka:29092 --list
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: securebank-rabbitmq
+    <<: *restart
+    hostname: securebank-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # management UI
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 25s
+
+  # ===========================================================================
+  # JVM SERVICES (built from the sibling repos)
+  # ===========================================================================
+
+  auth-service:
+    build:
+      context: ../securebank-auth-service
+      dockerfile: Dockerfile
+    image: securebank/auth-service:local
+    container_name: securebank-auth-service
+    <<: *restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      # auth-service owns its OWN database `auth` (spec §1).
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/auth
+      POSTGRES_USER: ${AUTH_DB_USER:-auth}
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD:-auth}
+      # REQUIRED — the docker profile has no insecure default for the JWT secret.
+      SECUREBANK_JWT_SECRET: ${SECUREBANK_JWT_SECRET:?set SECUREBANK_JWT_SECRET in .env}
+    ports:
+      - "8081:8081"   # REST (also exposes /swagger-ui.html, /actuator)
+      # gRPC 9091 is internal-only; not published. Reach it from inside the network.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/actuator/health/readiness | grep -q UP || exit 1"]
+      <<: *svc-hc-defaults
+
+  account-service:
+    build:
+      context: ../securebank-account-service
+      dockerfile: Dockerfile
+    image: securebank/account-service:local
+    container_name: securebank-account-service
+    <<: *restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      # Shared `securebank` DB; this service owns schema `accounts` (Flyway-managed).
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: securebank
+      POSTGRES_USER: ${SECUREBANK_DB_USER:-securebank}
+      POSTGRES_PASSWORD: ${SECUREBANK_DB_PASSWORD:-securebank}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    ports:
+      - "8082:8082"   # REST + actuator (gRPC 9092 internal-only)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/actuator/health/readiness | grep -q UP || exit 1"]
+      <<: *svc-hc-defaults
+
+  transaction-service:
+    build:
+      context: ../securebank-transaction-service
+      dockerfile: Dockerfile
+    image: securebank/transaction-service:local
+    container_name: securebank-transaction-service
+    <<: *restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      account-service:
+        condition: service_healthy
+      fraud-service:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      # Shared `securebank` DB; owns schema `ledger`.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/securebank
+      SPRING_DATASOURCE_USERNAME: ${SECUREBANK_DB_USER:-securebank}
+      SPRING_DATASOURCE_PASSWORD: ${SECUREBANK_DB_PASSWORD:-securebank}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # gRPC client targets (account:9092, fraud:9094) are already set by the
+      # service's application-docker.yml profile, so no env override is needed here.
+    ports:
+      - "8083:8083"   # REST + actuator (gRPC 9093 internal-only)
+    healthcheck:
+      # transaction-service doesn't enable the readiness health GROUP, so probe the
+      # aggregate /actuator/health endpoint.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8083/actuator/health | grep -q UP || exit 1"]
+      <<: *svc-hc-defaults
+
+  fraud-service:
+    build:
+      context: ../securebank-fraud-service
+      dockerfile: Dockerfile
+    image: securebank/fraud-service:local
+    container_name: securebank-fraud-service
+    <<: *restart
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # Leave the AI key blank to run the deterministic fraud/insights provider.
+      # Provide a real key in .env to enable the live LLM path (Claude).
+      SECUREBANK_AI_ENABLED: ${SECUREBANK_AI_ENABLED:-true}
+      SECUREBANK_AI_API_KEY: ${SECUREBANK_AI_API_KEY:-}
+      SECUREBANK_AI_MODEL: ${SECUREBANK_AI_MODEL:-claude-opus-4-8}
+    ports:
+      - "8084:8084"   # REST + actuator (gRPC 9094 internal-only)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8084/actuator/health/readiness | grep -q UP || exit 1"]
+      <<: *svc-hc-defaults
+
+  notification-service:
+    build:
+      context: ../securebank-notification-service
+      dockerfile: Dockerfile
+    image: securebank/notification-service:local
+    container_name: securebank-notification-service
+    <<: *restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      # Shared `securebank` DB; owns schema `notifications`.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/securebank?currentSchema=notifications
+      SPRING_DATASOURCE_USERNAME: ${SECUREBANK_DB_USER:-securebank}
+      SPRING_DATASOURCE_PASSWORD: ${SECUREBANK_DB_PASSWORD:-securebank}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_RABBITMQ_PORT: "5672"
+      SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-guest}
+      SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "8085:8085"   # REST + actuator
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8085/actuator/health/readiness | grep -q UP || exit 1"]
+      <<: *svc-hc-defaults
+
+  gateway:
+    build:
+      context: ../securebank-gateway
+      dockerfile: Dockerfile
+    image: securebank/gateway:local
+    container_name: securebank-gateway
+    <<: *restart
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      account-service:
+        condition: service_healthy
+      transaction-service:
+        condition: service_healthy
+      fraud-service:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      # The AuthService gRPC target (static://auth-service:9091) is already set by the
+      # gateway's application-docker.yml profile — no env override needed.
+    ports:
+      - "8080:8080"   # THE public API port
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP || exit 1"]
+      <<: *svc-hc-defaults
+
+  # ===========================================================================
+  # MICRO-FRONTENDS (Module Federation: shell host + two remotes)
+  # ===========================================================================
+  # Built from their sibling repos. Each repo ships its own Dockerfile (multi-stage
+  # node build -> static assets served by nginx). The shell proxies /api to the
+  # gateway; the remotes are loaded by the shell at runtime via remoteEntry.js.
+
+  shell:
+    build:
+      context: ../securebank-shell
+      dockerfile: Dockerfile
+    image: securebank/shell:local
+    container_name: securebank-shell
+    <<: *restart
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment:
+      # Where the shell sends /api traffic (nginx upstream inside the network).
+      GATEWAY_URL: http://gateway:8080
+    ports:
+      - "5170:80"
+
+  mfe-accounts:
+    build:
+      context: ../securebank-mfe-accounts
+      dockerfile: Dockerfile
+    image: securebank/mfe-accounts:local
+    container_name: securebank-mfe-accounts
+    <<: *restart
+    ports:
+      - "5171:80"
+
+  mfe-payments:
+    build:
+      context: ../securebank-mfe-payments
+      dockerfile: Dockerfile
+    image: securebank/mfe-payments:local
+    container_name: securebank-mfe-payments
+    <<: *restart
+    ports:
+      - "5172:80"
+
+  # ===========================================================================
+  # OBSERVABILITY (optional) — enable with: --profile observability
+  # ===========================================================================
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: securebank-kafka-ui
+    profiles: ["observability"]
+    <<: *restart
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: securebank
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    ports:
+      - "8090:8080"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: securebank-prometheus
+    profiles: ["observability"]
+    <<: *restart
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: securebank-grafana
+    profiles: ["observability"]
+    <<: *restart
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+# ---- Named volumes ----------------------------------------------------------
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:
+  rabbitmq-data:
+  prometheus-data:
+  grafana-data:
+
+# All services share the default bridge network created by compose; they reach
+# each other by service name (postgres, redis, kafka, auth-service, ...).
