@@ -1,0 +1,63 @@
+# =============================================================================
+# auth-service — REST 8081 + gRPC 9091 (server + client). Owns DB `auth`.
+# The gateway calls AuthService.ValidateToken over gRPC on 9091.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-service
+  namespace: securebank
+  labels: { app: auth-service }
+spec:
+  selector: { app: auth-service }
+  ports:
+    - { name: http, port: 8081, targetPort: http }
+    - { name: grpc, port: 9091, targetPort: grpc }   # named gRPC port
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: securebank
+  labels: { app: auth-service, app.kubernetes.io/part-of: securebank }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: auth-service }
+  template:
+    metadata:
+      labels: { app: auth-service }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      containers:
+        - name: auth-service
+          image: securebank/auth-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8081 }
+            - { name: grpc, containerPort: 9091 }
+          env:
+            - { name: SPRING_PROFILES_ACTIVE, value: "docker" }
+            # auth-service connects to its OWN database `auth`.
+            - { name: SPRING_DATASOURCE_URL, value: "jdbc:postgresql://postgres:5432/auth" }
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: AUTH_DB_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: AUTH_DB_PASSWORD } }
+            - name: SECUREBANK_JWT_SECRET
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: SECUREBANK_JWT_SECRET } }
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "768Mi" }

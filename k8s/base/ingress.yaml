@@ -1,0 +1,40 @@
+# =============================================================================
+# Ingress — public entrypoint.
+#   /api  -> gateway:8080   (the only backend exposed to the world)
+#   /     -> shell:5170     (the Module Federation host UI)
+#
+# The remotes (mfe-accounts/mfe-payments) are loaded by the shell at runtime; they
+# are NOT routed here directly in prod (the shell's nginx or the browser fetches
+# their remoteEntry.js — see docs/micro-frontends.md). For a kind/minikube demo you
+# can add /accounts and /payments paths if you want to hit them standalone.
+#
+# Assumes an ingress-nginx controller. Order matters: the more specific /api rule is
+# listed before the catch-all /.
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: securebank
+  namespace: securebank
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    # /api is forwarded as-is (gateway expects the full /api/... path).
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: securebank.localtest.me
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port: { number: 8080 }
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: shell
+                port: { number: 5170 }

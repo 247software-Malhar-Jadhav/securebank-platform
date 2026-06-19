@@ -1,0 +1,45 @@
+# =============================================================================
+# Kustomize BASE — the full SecureBank platform. Overlays (dev/prod) patch this.
+# Apply directly with:  kubectl apply -k k8s/base
+# Or via an overlay:     kubectl apply -k k8s/overlays/dev
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: securebank
+
+commonLabels:
+  app.kubernetes.io/part-of: securebank
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  # infrastructure
+  - postgres.yaml
+  - redis.yaml
+  - kafka.yaml
+  - rabbitmq.yaml
+  # services
+  - auth-service.yaml
+  - account-service.yaml
+  - transaction-service.yaml
+  - fraud-service.yaml
+  - notification-service.yaml
+  - gateway.yaml
+  # frontends
+  - frontends.yaml
+  # edge + scaling
+  - ingress.yaml
+  - hpa.yaml
+
+images:
+  - { name: securebank/gateway,              newTag: local }
+  - { name: securebank/auth-service,         newTag: local }
+  - { name: securebank/account-service,      newTag: local }
+  - { name: securebank/transaction-service,  newTag: local }
+  - { name: securebank/fraud-service,        newTag: local }
+  - { name: securebank/notification-service, newTag: local }
+  - { name: securebank/shell,                newTag: local }
+  - { name: securebank/mfe-accounts,         newTag: local }
+  - { name: securebank/mfe-payments,         newTag: local }

@@ -1,0 +1,58 @@
+# =============================================================================
+# fraud-service — REST 8084 + gRPC 9094 (server). No relational DB; uses Redis.
+# Scores transfers for transaction-service; serves /api/insights + /api/assistant.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: fraud-service
+  namespace: securebank
+  labels: { app: fraud-service }
+spec:
+  selector: { app: fraud-service }
+  ports:
+    - { name: http, port: 8084, targetPort: http }
+    - { name: grpc, port: 9094, targetPort: grpc }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-service
+  namespace: securebank
+  labels: { app: fraud-service, app.kubernetes.io/part-of: securebank }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: fraud-service }
+  template:
+    metadata:
+      labels: { app: fraud-service }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8084"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      containers:
+        - name: fraud-service
+          image: securebank/fraud-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8084 }
+            - { name: grpc, containerPort: 9094 }
+          envFrom:
+            - configMapRef: { name: securebank-config }   # REDIS_*, SECUREBANK_AI_*
+          env:
+            - name: SECUREBANK_AI_API_KEY
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: SECUREBANK_AI_API_KEY } }
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: http }
+            initialDelaySeconds: 25
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            initialDelaySeconds: 50
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "768Mi" }

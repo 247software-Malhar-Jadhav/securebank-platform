@@ -1,0 +1,61 @@
+# =============================================================================
+# account-service — REST 8082 + gRPC 9092 (server). Owns schema `accounts` in the
+# shared `securebank` DB. Uses Redis for distributed locks. gRPC Debit/Credit are
+# called by transaction-service.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: account-service
+  namespace: securebank
+  labels: { app: account-service }
+spec:
+  selector: { app: account-service }
+  ports:
+    - { name: http, port: 8082, targetPort: http }
+    - { name: grpc, port: 9092, targetPort: grpc }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: account-service
+  namespace: securebank
+  labels: { app: account-service, app.kubernetes.io/part-of: securebank }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: account-service }
+  template:
+    metadata:
+      labels: { app: account-service }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8082"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      containers:
+        - name: account-service
+          image: securebank/account-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8082 }
+            - { name: grpc, containerPort: 9092 }
+          envFrom:
+            - configMapRef: { name: securebank-config }   # POSTGRES_HOST/PORT/DB, REDIS_*
+          env:
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: SECUREBANK_DB_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: SECUREBANK_DB_PASSWORD } }
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "768Mi" }

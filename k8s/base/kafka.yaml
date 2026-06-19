@@ -1,0 +1,165 @@
+# =============================================================================
+# Kafka + Zookeeper (Confluent images), single-broker, for dev/demo parity.
+#
+# PRODUCTION PATH: use the Strimzi operator (a Kafka CR) instead of this manual
+# StatefulSet — see the commented Strimzi example at the bottom and docs/kafka-guide.md.
+# Strimzi handles rolling upgrades, storage, listeners, topic CRs (KafkaTopic), and
+# can run KRaft (no Zookeeper). This manual setup mirrors docker-compose so the same
+# `kafka:29092` internal listener works unchanged.
+#
+# The 4lw whitelist (ruok,srvr,conf) is set on Zookeeper so the `ruok` probe works.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: zookeeper
+  namespace: securebank
+  labels: { app: zookeeper }
+spec:
+  selector: { app: zookeeper }
+  ports:
+    - { name: client, port: 2181, targetPort: 2181 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zookeeper
+  namespace: securebank
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: zookeeper }
+  template:
+    metadata:
+      labels: { app: zookeeper }
+    spec:
+      containers:
+        - name: zookeeper
+          image: confluentinc/cp-zookeeper:7.6.1
+          ports:
+            - { name: client, containerPort: 2181 }
+          env:
+            - { name: ZOOKEEPER_CLIENT_PORT, value: "2181" }
+            - { name: ZOOKEEPER_TICK_TIME, value: "2000" }
+            # Whitelist the 4-letter words so the `ruok` readiness probe returns imok.
+            - { name: ZOOKEEPER_4LW_COMMANDS_WHITELIST, value: "ruok,srvr,conf" }
+          readinessProbe:
+            exec:
+              # bash (shipped in the Confluent image) — /dev/tcp is a bash builtin.
+              command: ["bash", "-c", "echo ruok | (exec 3<>/dev/tcp/localhost/2181; cat >&3; cat <&3) | grep -q imok"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: securebank
+  labels: { app: kafka }
+spec:
+  selector: { app: kafka }
+  ports:
+    - { name: internal, port: 29092, targetPort: 29092 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: securebank
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels: { app: kafka }
+  template:
+    metadata:
+      labels: { app: kafka }
+    spec:
+      containers:
+        - name: kafka
+          image: confluentinc/cp-kafka:7.6.1
+          ports:
+            - { name: internal, containerPort: 29092 }
+          env:
+            - { name: KAFKA_BROKER_ID, value: "1" }
+            - { name: KAFKA_ZOOKEEPER_CONNECT, value: "zookeeper:2181" }
+            - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, value: "INTERNAL:PLAINTEXT" }
+            - { name: KAFKA_LISTENERS, value: "INTERNAL://0.0.0.0:29092" }
+            # Advertise the in-cluster DNS name on the internal listener (spec §8).
+            - { name: KAFKA_ADVERTISED_LISTENERS, value: "INTERNAL://kafka:29092" }
+            - { name: KAFKA_INTER_BROKER_LISTENER_NAME, value: "INTERNAL" }
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, value: "1" }
+            - { name: KAFKA_AUTO_CREATE_TOPICS_ENABLE, value: "false" }
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "kafka-broker-api-versions --bootstrap-server kafka:29092 >/dev/null 2>&1"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 10
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+      volumes: []
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 5Gi } }
+---
+# One-shot Job: create the 3 domain topics once Kafka is reachable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topics-init
+  namespace: securebank
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels: { app: kafka-topics-init }
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: create-topics
+          image: confluentinc/cp-kafka:7.6.1
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              until kafka-broker-api-versions --bootstrap-server kafka:29092 >/dev/null 2>&1; do
+                echo "waiting for kafka..."; sleep 5;
+              done
+              for t in securebank.transactions securebank.fraud-alerts securebank.notifications; do
+                kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+                  --topic "$t" --partitions 3 --replication-factor 1
+              done
+              kafka-topics --bootstrap-server kafka:29092 --list
+# =============================================================================
+# PROD ALTERNATIVE (Strimzi) — apply the operator first, then something like:
+#
+# apiVersion: kafka.strimzi.io/v1beta2
+# kind: Kafka
+# metadata: { name: securebank, namespace: securebank }
+# spec:
+#   kafka:
+#     replicas: 3
+#     listeners:
+#       - { name: internal, port: 9092, type: internal, tls: false }
+#     config:
+#       offsets.topic.replication.factor: 3
+#       transaction.state.log.replication.factor: 3
+#       min.insync.replicas: 2
+#     storage: { type: persistent-claim, size: 100Gi }
+#   zookeeper: { replicas: 3, storage: { type: persistent-claim, size: 10Gi } }
+# ---
+# apiVersion: kafka.strimzi.io/v1beta2
+# kind: KafkaTopic
+# metadata: { name: securebank.transactions, namespace: securebank, labels: { strimzi.io/cluster: securebank } }
+# spec: { partitions: 3, replicas: 3 }
+# (repeat for securebank.fraud-alerts and securebank.notifications)
+# =============================================================================

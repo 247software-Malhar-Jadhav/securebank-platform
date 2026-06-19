@@ -1,0 +1,7 @@
+# The single namespace that holds the whole SecureBank platform.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: securebank
+  labels:
+    app.kubernetes.io/part-of: securebank

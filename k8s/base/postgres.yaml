@@ -1,0 +1,98 @@
+# =============================================================================
+# Postgres as a StatefulSet (stable network id + a PersistentVolumeClaim per pod).
+#
+# PRODUCTION NOTE: for a real deployment prefer a MANAGED Postgres (AWS RDS / Aurora,
+# GCP Cloud SQL, Azure Database) or an operator (CloudNativePG, Zalando). An in-cluster
+# single-replica StatefulSet has no HA and ties your data durability to the cluster.
+# This manifest is for dev/demo parity with docker-compose. To switch to managed DB:
+# delete this file from the kustomization and point POSTGRES_HOST at the managed
+# endpoint in the ConfigMap/Secret.
+#
+# The init SQL (creates databases `auth` + `securebank` and the login roles) is mounted
+# from a ConfigMap into /docker-entrypoint-initdb.d, exactly like the compose setup.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: securebank
+data:
+  01-init-databases.sql: |
+    CREATE ROLE auth       WITH LOGIN PASSWORD 'auth';
+    CREATE ROLE securebank WITH LOGIN PASSWORD 'securebank';
+    CREATE DATABASE auth       OWNER auth;
+    CREATE DATABASE securebank OWNER securebank;
+    GRANT ALL PRIVILEGES ON DATABASE auth       TO auth;
+    GRANT ALL PRIVILEGES ON DATABASE securebank TO securebank;
+    \connect securebank
+    ALTER SCHEMA public OWNER TO securebank;
+    GRANT ALL ON SCHEMA public TO securebank;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: securebank
+  labels: { app: postgres }
+spec:
+  # Headless service backing the StatefulSet (stable DNS: postgres-0.postgres).
+  clusterIP: None
+  selector: { app: postgres }
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: securebank
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          env:
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: POSTGRES_SUPERUSER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: POSTGRES_SUPERPASSWORD } }
+            - name: POSTGRES_DB
+              value: postgres
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: init, mountPath: /docker-entrypoint-initdb.d }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "postgres", "-d", "postgres"] }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec: { command: ["pg_isready", "-U", "postgres", "-d", "postgres"] }
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "250m", memory: "256Mi" }
+            limits:   { cpu: "1",    memory: "1Gi" }
+      volumes:
+        - name: init
+          configMap: { name: postgres-init }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

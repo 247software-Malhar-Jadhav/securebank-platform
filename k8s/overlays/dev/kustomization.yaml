@@ -1,0 +1,42 @@
+# =============================================================================
+# DEV overlay — for kind/minikube. Single replicas, relaxed resources, plaintext
+# template Secret from the base (fine for a local cluster). HPAs are dropped (no
+# need to autoscale a laptop cluster) via a patch deletion.
+#
+# Apply:  kubectl apply -k k8s/overlays/dev
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: securebank
+
+resources:
+  - ../../base
+
+# Single gateway/shell replica locally.
+patches:
+  - target: { kind: Deployment, name: gateway }
+    patch: |
+      - { op: replace, path: /spec/replicas, value: 1 }
+  - target: { kind: Deployment, name: shell }
+    patch: |
+      - { op: replace, path: /spec/replicas, value: 1 }
+  # Remove the HPAs in dev (delete the three by name).
+  - target: { kind: HorizontalPodAutoscaler, name: gateway }
+    patch: |
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata: { name: gateway, namespace: securebank }
+  - target: { kind: HorizontalPodAutoscaler, name: transaction-service }
+    patch: |
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata: { name: transaction-service, namespace: securebank }
+  - target: { kind: HorizontalPodAutoscaler, name: account-service }
+    patch: |
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata: { name: account-service, namespace: securebank }

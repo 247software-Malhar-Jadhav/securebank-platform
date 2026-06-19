@@ -1,0 +1,64 @@
+# =============================================================================
+# notification-service — REST 8085. Kafka CONSUMER of securebank.transactions ->
+# renders a localized message -> publishes to RabbitMQ. Owns schema `notifications`
+# in the shared `securebank` DB. No gRPC.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  namespace: securebank
+  labels: { app: notification-service }
+spec:
+  selector: { app: notification-service }
+  ports:
+    - { name: http, port: 8085, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: securebank
+  labels: { app: notification-service, app.kubernetes.io/part-of: securebank }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: notification-service }
+  template:
+    metadata:
+      labels: { app: notification-service }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8085"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      containers:
+        - name: notification-service
+          image: securebank/notification-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8085 }
+          envFrom:
+            - configMapRef: { name: securebank-config }   # KAFKA + RABBITMQ host/port
+          env:
+            - { name: SPRING_DATASOURCE_URL, value: "jdbc:postgresql://postgres:5432/securebank?currentSchema=notifications" }
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: SECUREBANK_DB_USER } }
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: SECUREBANK_DB_PASSWORD } }
+            - name: SPRING_RABBITMQ_USERNAME
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: RABBITMQ_USER } }
+            - name: SPRING_RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: RABBITMQ_PASSWORD } }
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits:   { cpu: "750m", memory: "768Mi" }

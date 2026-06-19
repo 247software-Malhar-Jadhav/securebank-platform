@@ -1,0 +1,49 @@
+# =============================================================================
+# PROD overlay — pinned image tags from your registry, higher replica floors, and
+# a hard reminder that the template Secret MUST be replaced.
+#
+# BEFORE deploying:
+#   1. Replace the base Secret with a SealedSecret / ExternalSecret / Vault sync.
+#      Do NOT apply k8s/base/secret.yaml's plaintext values in prod.
+#   2. Point Postgres/Kafka/Redis/RabbitMQ at managed services (edit the ConfigMap
+#      hosts and delete the in-cluster StatefulSets) OR run the operators
+#      (CloudNativePG, Strimzi, RabbitMQ Cluster Operator).
+#   3. Set `newName`/`newTag` below to your registry images + immutable tags.
+#
+# Apply:  kubectl apply -k k8s/overlays/prod
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: securebank
+
+resources:
+  - ../../base
+
+# Pin to registry images with an immutable release tag (replace REGISTRY + tag).
+images:
+  - { name: securebank/gateway,              newName: REGISTRY/securebank/gateway,              newTag: "1.0.0" }
+  - { name: securebank/auth-service,         newName: REGISTRY/securebank/auth-service,         newTag: "1.0.0" }
+  - { name: securebank/account-service,      newName: REGISTRY/securebank/account-service,      newTag: "1.0.0" }
+  - { name: securebank/transaction-service,  newName: REGISTRY/securebank/transaction-service,  newTag: "1.0.0" }
+  - { name: securebank/fraud-service,        newName: REGISTRY/securebank/fraud-service,        newTag: "1.0.0" }
+  - { name: securebank/notification-service, newName: REGISTRY/securebank/notification-service, newTag: "1.0.0" }
+  - { name: securebank/shell,                newName: REGISTRY/securebank/shell,                newTag: "1.0.0" }
+  - { name: securebank/mfe-accounts,         newName: REGISTRY/securebank/mfe-accounts,         newTag: "1.0.0" }
+  - { name: securebank/mfe-payments,         newName: REGISTRY/securebank/mfe-payments,         newTag: "1.0.0" }
+
+# Production replica floors (HPAs scale above these).
+replicas:
+  - { name: gateway, count: 3 }
+  - { name: transaction-service, count: 3 }
+  - { name: account-service, count: 3 }
+  - { name: auth-service, count: 2 }
+  - { name: fraud-service, count: 2 }
+  - { name: notification-service, count: 2 }
+  - { name: shell, count: 2 }
+
+patches:
+  # Tighten image pulls for a registry-backed cluster.
+  - target: { kind: Deployment, labelSelector: "app.kubernetes.io/part-of=securebank" }
+    patch: |
+      - { op: replace, path: /spec/template/spec/containers/0/imagePullPolicy, value: IfNotPresent }

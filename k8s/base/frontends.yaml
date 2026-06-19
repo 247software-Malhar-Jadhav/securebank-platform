@@ -1,0 +1,125 @@
+# =============================================================================
+# Micro-frontends: shell (host) + mfe-accounts + mfe-payments (remotes).
+# Each is a static nginx image built from its repo. The shell serves at "/"
+# (via Ingress) and proxies /api to the gateway; the remotes serve their built
+# assets (remoteEntry.js) that the shell loads at runtime.
+# Ports are 80 inside the container (nginx); Services expose the spec ports.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: shell
+  namespace: securebank
+  labels: { app: shell }
+spec:
+  selector: { app: shell }
+  ports:
+    - { name: http, port: 5170, targetPort: 80 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shell
+  namespace: securebank
+  labels: { app: shell, app.kubernetes.io/part-of: securebank }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: shell }
+  template:
+    metadata:
+      labels: { app: shell }
+    spec:
+      containers:
+        - name: shell
+          image: securebank/shell:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 80 }
+          env:
+            - { name: GATEWAY_URL, value: "http://gateway:8080" }
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "250m", memory: "128Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mfe-accounts
+  namespace: securebank
+  labels: { app: mfe-accounts }
+spec:
+  selector: { app: mfe-accounts }
+  ports:
+    - { name: http, port: 5171, targetPort: 80 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mfe-accounts
+  namespace: securebank
+  labels: { app: mfe-accounts, app.kubernetes.io/part-of: securebank }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mfe-accounts }
+  template:
+    metadata:
+      labels: { app: mfe-accounts }
+    spec:
+      containers:
+        - name: mfe-accounts
+          image: securebank/mfe-accounts:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 80 }
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "250m", memory: "128Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mfe-payments
+  namespace: securebank
+  labels: { app: mfe-payments }
+spec:
+  selector: { app: mfe-payments }
+  ports:
+    - { name: http, port: 5172, targetPort: 80 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mfe-payments
+  namespace: securebank
+  labels: { app: mfe-payments, app.kubernetes.io/part-of: securebank }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mfe-payments }
+  template:
+    metadata:
+      labels: { app: mfe-payments }
+    spec:
+      containers:
+        - name: mfe-payments
+          image: securebank/mfe-payments:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 80 }
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { cpu: "250m", memory: "128Mi" }

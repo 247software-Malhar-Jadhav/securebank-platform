@@ -1,0 +1,46 @@
+# =============================================================================
+# Non-secret configuration shared by the services. Secrets (passwords, JWT key,
+# AI key) live in secret.yaml. Each Deployment pulls the keys it needs via
+# `envFrom` / explicit `valueFrom.configMapKeyRef`.
+#
+# In-cluster hostnames are the Kubernetes Service names below (postgres, redis,
+# kafka, rabbitmq, <service>-svc on its gRPC port). Same idea as the docker
+# `docker` profile, so SPRING_PROFILES_ACTIVE=docker is reused unchanged.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: securebank-config
+  namespace: securebank
+data:
+  SPRING_PROFILES_ACTIVE: "docker"
+
+  # ---- Postgres ----
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  # account-service style (shared securebank DB)
+  POSTGRES_DB: "securebank"
+  # auth-service connects to its own DB `auth` (set per-deployment below).
+
+  # ---- Redis ----
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+
+  # ---- Kafka (internal advertised listener) ----
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+
+  # ---- RabbitMQ ----
+  SPRING_RABBITMQ_HOST: "rabbitmq"
+  SPRING_RABBITMQ_PORT: "5672"
+
+  # ---- gRPC client targets ----
+  # NOTE: net.devh's property keys contain a hyphen (grpc.client.auth-service.address),
+  # which does NOT round-trip cleanly through an UPPER_SNAKE env var, so we do NOT set
+  # them here. Each service's application-docker.yml profile (baked into the image)
+  # already points its named channels at the in-cluster service names on their gRPC
+  # ports (auth:9091, account:9092, fraud:9094) — the Service names match, so it works
+  # unchanged in Kubernetes.
+
+  # ---- Fraud AI ----
+  SECUREBANK_AI_ENABLED: "true"
+  SECUREBANK_AI_MODEL: "claude-opus-4-8"

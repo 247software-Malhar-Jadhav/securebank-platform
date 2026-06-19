@@ -1,0 +1,56 @@
+# =============================================================================
+# gateway — the ONLY publicly reachable backend (REST 8080). Spring Cloud Gateway.
+# gRPC CLIENT of auth-service (9091) for ValidateToken. Routes /api/* to services.
+# Exposed to the world via the Ingress (see ingress.yaml).
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: securebank
+  labels: { app: gateway }
+spec:
+  selector: { app: gateway }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: securebank
+  labels: { app: gateway, app.kubernetes.io/part-of: securebank }
+spec:
+  replicas: 2   # public entrypoint; run at least 2 for availability (HPA scales up).
+  selector:
+    matchLabels: { app: gateway }
+  template:
+    metadata:
+      labels: { app: gateway }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      containers:
+        - name: gateway
+          image: securebank/gateway:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8080 }
+          # The gateway's gRPC auth target is set by its application-docker.yml profile;
+          # SPRING_PROFILES_ACTIVE comes from the ConfigMap.
+          envFrom:
+            - configMapRef: { name: securebank-config }
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            initialDelaySeconds: 45
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "250m", memory: "384Mi" }
+            limits:   { cpu: "1",    memory: "640Mi" }

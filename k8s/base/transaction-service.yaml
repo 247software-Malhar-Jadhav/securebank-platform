@@ -1,0 +1,67 @@
+# =============================================================================
+# transaction-service — REST 8083 + gRPC 9093 (server) + gRPC CLIENT of account
+# (9092) and fraud (9094). Owns schema `ledger` in the shared `securebank` DB.
+# Kafka producer to securebank.transactions. This is the SAGA orchestrator.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: transaction-service
+  namespace: securebank
+  labels: { app: transaction-service }
+spec:
+  selector: { app: transaction-service }
+  ports:
+    - { name: http, port: 8083, targetPort: http }
+    - { name: grpc, port: 9093, targetPort: grpc }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transaction-service
+  namespace: securebank
+  labels: { app: transaction-service, app.kubernetes.io/part-of: securebank }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: transaction-service }
+  template:
+    metadata:
+      labels: { app: transaction-service }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8083"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      containers:
+        - name: transaction-service
+          image: securebank/transaction-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8083 }
+            - { name: grpc, containerPort: 9093 }
+          # KAFKA bootstrap + profile come from the ConfigMap; the account/fraud gRPC
+          # client targets are set by this service's application-docker.yml profile.
+          envFrom:
+            - configMapRef: { name: securebank-config }
+          env:
+            - { name: SPRING_DATASOURCE_URL, value: "jdbc:postgresql://postgres:5432/securebank" }
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: SECUREBANK_DB_USER } }
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom: { secretKeyRef: { name: securebank-secret, key: SECUREBANK_DB_PASSWORD } }
+          # transaction-service does not enable the liveness/readiness health GROUPS
+          # in its config, so probe the aggregate /actuator/health endpoint instead
+          # (Spring also auto-enables the groups under k8s, but this is robust either way).
+          readinessProbe:
+            httpGet: { path: /actuator/health, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            httpGet: { path: /actuator/health, port: http }
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "300m", memory: "512Mi" }
+            limits:   { cpu: "1",    memory: "768Mi" }
