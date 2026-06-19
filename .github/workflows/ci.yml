@@ -1,0 +1,71 @@
+# =============================================================================
+# Platform CI — validates the DEPLOYMENT GLUE only.
+#
+# This repo does NOT build the services: each securebank-* service repo has its own
+# build/test/publish CI (see docs/cicd.md). Here we just guarantee that a change to
+# the compose file or the k8s manifests is syntactically valid and renders cleanly,
+# so a broken deployment descriptor can't merge.
+# =============================================================================
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate-compose:
+    name: Validate docker-compose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Compose v2 ships with the ubuntu-latest runner's Docker. `config` parses the
+      # file, expands anchors, interpolates env and resolves profiles — a full syntax
+      # + reference check without starting anything.
+      - name: docker compose config
+        run: |
+          cp .env.example .env
+          docker compose config -q
+          echo "compose OK"
+
+      # Confirm the observability profile also resolves.
+      - name: docker compose config (observability profile)
+        run: docker compose --profile observability config -q
+
+  validate-kustomize:
+    name: Validate kustomize + manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+          kustomize version
+
+      - name: Install kubeconform
+        run: |
+          curl -sLo kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar xf kubeconform.tar.gz
+          sudo mv kubeconform /usr/local/bin/
+          kubeconform -v
+
+      # Each kustomization must render without error...
+      - name: kustomize build (base + overlays)
+        run: |
+          for d in k8s/base k8s/overlays/dev k8s/overlays/prod; do
+            echo "== building $d =="
+            kustomize build "$d" > "/tmp/$(basename $d).yaml"
+          done
+
+      # ...and the rendered manifests must validate against the k8s API schemas.
+      # -ignore-missing-schemas tolerates CRDs (Strimzi/SealedSecret) if added later.
+      - name: kubeconform (schema validation)
+        run: |
+          for f in /tmp/base.yaml /tmp/dev.yaml /tmp/prod.yaml; do
+            echo "== validating $f =="
+            kubeconform -strict -ignore-missing-schemas -summary "$f"
+          done
