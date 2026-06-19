@@ -1,0 +1,29 @@
+# Secrets / local env — NEVER commit real values
+.env
+.env.*
+!.env.example
+
+# Rendered/temporary kustomize output
+k8s/**/rendered.yaml
+*.rendered.yaml
+
+# Sealed/unsealed secret material that may land here locally
+sealed-secret.yaml
+*.dec.yaml
+
+# Local volumes / data if ever bind-mounted
+data/
+pgdata/
+*.dump
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
+logs/
