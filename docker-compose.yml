@@ -88,16 +88,16 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-      # IMPORTANT: the Confluent image LOCKS DOWN the 4-letter-word admin commands
-      # by default. The healthcheck below uses `ruok`, so we MUST whitelist it (plus
-      # srvr/conf for diagnostics). Forgetting this makes `ruok` return nothing and
-      # the healthcheck never goes healthy — a real bug we hit in a previous compose.
+      # NOTE: the Confluent image locks down the 4-letter-word admin commands and the
+      # ZOOKEEPER_4LW_COMMANDS_WHITELIST env var does NOT reliably enable `ruok` in this
+      # image build (verified: `ruok` stays "not in the whitelist"). `srvr` IS enabled by
+      # default, so the healthcheck below uses `srvr` and looks for the "Mode:" line.
       ZOOKEEPER_4LW_COMMANDS_WHITELIST: "ruok,srvr,conf"
     healthcheck:
-      # `ruok` returns "imok" only when ZK is up AND ruok is whitelisted (above).
+      # `srvr` prints server stats (incl. a "Mode:" line) once ZK is accepting clients.
       # Use bash explicitly (the Confluent image ships it) so the /dev/tcp redirection
       # works — /dev/tcp is a bash builtin, not available in plain sh/dash.
-      test: ["CMD", "bash", "-c", "echo ruok | (exec 3<>/dev/tcp/localhost/2181; cat >&3; cat <&3) | grep -q imok"]
+      test: ["CMD", "bash", "-c", "echo srvr | (exec 3<>/dev/tcp/localhost/2181; cat >&3; cat <&3) | grep -q Mode"]
       interval: 10s
       timeout: 5s
       retries: 15
